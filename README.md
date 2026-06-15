@@ -374,6 +374,8 @@ GITHUB_TOKEN=ghp_xxx uv run scripts/clean_actions_runs.py --repo zhflemon/anyrou
 
 如果你需要在本地测试或开发，请按照以下步骤设置：
 
+### 首次安装
+
 ```bash
 # 安装所有依赖
 uv sync --dev
@@ -381,20 +383,49 @@ uv sync --dev
 # 安装 CloakBrowser 浏览器
 uv run python -m cloakbrowser install
 # 如需使用本地浏览器，可设置 CLOAKBROWSER_BINARY_PATH=/path/to/browser
+```
 
-# 创建 .env 文件并配置（注意：JSON 必须是单行格式）
-# 示例：
-# ANYROUTER_ACCOUNTS=[{"name":"账号1","email":"your@email.com","password":"your_password"}]
-# PROVIDERS={"agentrouter":{"domain":"https://agentrouter.org"}}
-# PROXY_SUBSCRIPTION_URL=https://example.com/sub?token=xxx
-# CHECKIN_PROXY_URL=http://127.0.0.1:7890
+### 配置
 
-# 运行签到脚本
+复制 `.env.example` 为 `.env`，填入你的账号信息（JSON 内容必须是单行格式）：
+
+```bash
+cp .env.example .env
+```
+
+推荐使用邮箱密码方式配置账号，让脚本自动登录获取 session：
+
+```
+ANYROUTER_ACCOUNTS=[{"name":"主账号","provider":"anyrouter","email":"your@email.com","password":"your_password"},{"name":"备用","provider":"agentrouter","email":"other@email.com","password":"other_password"}]
+```
+
+### 运行签到
+
+```bash
+# 手动运行
 uv run checkin.py
+
+# 使用批处理文件运行（自动保存日志到 logs/ 目录）
+run_checkin.bat
+
+# 静默运行（不暂停）
+run_checkin.bat --no-pause
 
 # 可选：清理累积的 Actions 运行历史
 uv run scripts/clean_actions_runs.py --keep 10
 ```
+
+### 设置定时自动签到（Windows）
+
+1. 双击 `run_checkin.bat` 测试能否正常运行
+2. 打开 **任务计划程序**
+3. 点击右侧 **创建基本任务**
+4. 名称：`AnyRouter 签到`
+5. 触发器：**每天**，设定时间（建议凌晨或跟你 Actions 错开）
+6. 操作：**启动程序** → 浏览选择 `run_checkin.bat`，参数填 `--no-pause`
+7. 完成
+
+> 每次运行日志会自动保存到 `logs/checkin_YYYY-MM-DD_HH-MM-SS.log`
 
 ## 测试
 
