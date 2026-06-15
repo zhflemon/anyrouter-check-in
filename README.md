@@ -1,5 +1,7 @@
 # Any Router 多账号自动签到
 
+> 2026年06月15日 更新
+
 [![GitHub Actions](https://github.com/millylee/anyrouter-check-in/workflows/PR%20Quality%20Checks/badge.svg)](https://github.com/millylee/anyrouter-check-in/actions)
 [![codecov](https://codecov.io/gh/millylee/anyrouter-check-in/branch/main/graph/badge.svg)](https://codecov.io/gh/millylee/anyrouter-check-in)
 [![pre-commit.ci status](https://results.pre-commit.ci/badge/github/millylee/anyrouter-check-in/main.svg)](https://results.pre-commit.ci/latest/github/millylee/anyrouter-check-in/main)
@@ -341,6 +343,23 @@ PROVIDERS={"agentrouter":{"use_proxy":true}}
 2. 每个通知方式都是独立的，可以只配置你需要的推送方式
 3. 如果某个通知方式配置不正确或未配置，脚本会自动跳过该通知方式
 
+## 清理 Actions 运行记录
+
+项目长期运行会积累大量 workflow 历史记录（本仓库曾积累 974 条）。可以用脚本批量清理：
+
+```bash
+# 清理所有记录（自动从 git remote 获取仓库、从 .git-credentials 获取 token）
+uv run scripts/clean_actions_runs.py
+
+# 保留最近 10 条，删除更早的
+uv run scripts/clean_actions_runs.py --keep 10
+
+# 指定 Token 和仓库
+GITHUB_TOKEN=ghp_xxx uv run scripts/clean_actions_runs.py --repo zhflemon/anyrouter-check-in
+```
+
+脚本会在删除前询问确认，避免误删。
+
 ## 故障排除
 
 如果签到失败，请检查：
@@ -372,6 +391,9 @@ uv run python -m cloakbrowser install
 
 # 运行签到脚本
 uv run checkin.py
+
+# 可选：清理累积的 Actions 运行历史
+uv run scripts/clean_actions_runs.py --keep 10
 ```
 
 ## 测试
