@@ -234,6 +234,146 @@ async def login_with_credentials(
 		return None
 
 
+async def login_with_session_cookies(
+	account_name: str,
+	provider_config,
+	provider_name: str,
+	user_cookies: dict,
+	*,
+	api_user: str | None = None,
+) -> BrowserLoginResult | None:
+	"""使用浏览器验证 session cookies（适用于需要 WAF 绕过的账号）。
+
+	设置用户 session cookies + New-Api-User 请求头后导航到控制台，
+	浏览器正常解析 WAF 挑战，拦截 /api/user/self 响应并捕获所有 cookies（含有效 WAF cookies）。
+	"""
+	print(f'[PROCESSING] {account_name}: Verifying session via browser (WAF bypass)...')
+
+	console_url = f'{provider_config.domain}/console'
+	settings = load_browser_login_settings(
+		account_name,
+		provider_name,
+		persist_profile=False,
+	)
+	timeout_ms = settings.wait_timeout_ms
+
+	debug_print(
+		f'[INFO] {account_name}: Browser profile={settings.profile_dir}, '
+		f'headless={settings.headless}, humanize={settings.humanize}, timeout={timeout_ms}ms'
+	)
+
+	print(
+		f'[INFO] {account_name}: Provider proxy={"enabled" if provider_config.use_proxy else "disabled"} '
+		f'({provider_name})'
+	)
+
+	try:
+		context = await launch_login_context(settings, use_proxy=provider_config.use_proxy)
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Browser launch failed: {e}')
+		return None
+
+	page = None
+	try:
+		page = await context.new_page()
+		await prepare_browser_page(page)
+
+		# Step 1: Set New-Api-User request header — required by agentrouter for auth
+		if api_user:
+			await page.set_extra_http_headers({provider_config.api_user_key: api_user})
+			print(f'[INFO] {account_name}: Set {provider_config.api_user_key}={api_user} request header')
+		else:
+			print(f'[WARN] {account_name}: No api_user provided, browser auth may fail')
+
+		# Step 2: Warm up — navigate to domain first so document.cookie can set cookies
+		# Chromium 140+ does not send cookies set via add_cookies() with HTTP requests.
+		# We must navigate to the provider domain first, then set cookies via document.cookie.
+		warmup_url = provider_config.domain + '/login'
+		try:
+			print(f'[INFO] {account_name}: Warming up {warmup_url}...')
+			await page.goto(warmup_url, wait_until='load', timeout=min(timeout_ms, 60_000))
+			await asyncio.sleep(2)
+		except Exception as e:
+			print(f'[WARN] {account_name}: Warmup navigation failed: {e}')
+
+		# Step 3: Set user's session cookies via document.cookie (page is now on the provider domain)
+		# Filter out stale WAF cookies — let the browser get fresh ones from the WAF challenge
+		session_only = {
+			name: value for name, value in user_cookies.items()
+			if not provider_config.waf_cookie_names or name not in provider_config.waf_cookie_names
+		}
+		if session_only:
+			set_count = 0
+			for name, value in session_only.items():
+				try:
+					await page.evaluate(f'document.cookie = "{name}={value}; path=/; secure"')
+					set_count += 1
+				except Exception as e:
+					debug_print(f'[INFO] {account_name}: Failed to set cookie {name}: {e}')
+			filtered = len(user_cookies) - len(session_only)
+			detail = f', filtered out {filtered} stale WAF cookie(s)' if filtered else ''
+			print(f'[INFO] {account_name}: Set {set_count} session cookie(s) via document.cookie{detail}')
+		else:
+			print(f'[WARN] {account_name}: No non-WAF cookies to set, proceeding with fresh browser')
+
+		# Step 4: Navigate to console — browser resolves WAF, session cookies + header authenticate
+		# Auto check-in triggers when the console page loads (agentrouter: login = check-in)
+		user_profile = await verify_browser_login(page, console_url, timeout_ms)
+
+		if not user_profile:
+			# Fallback: SPA may have redirected to /login before /api/user/self was called.
+			# Try a manual API fetch to verify the session — cookies set via document.cookie
+			# ARE sent when fetch() uses credentials='include'.
+			print(f'[INFO] {account_name}: Browser login timed out, trying manual API fetch fallback...')
+			if api_user:
+				try:
+					fetch_result = await page.evaluate(f"""
+						async () => {{
+							const resp = await fetch('{provider_config.user_info_path}', {{
+								credentials: 'include',
+								headers: {{'{provider_config.api_user_key}': '{api_user}'}}
+							}});
+							const data = await resp.json();
+							return JSON.stringify(data);
+						}}
+					""")
+					fetch_data = json.loads(fetch_result)
+					if fetch_data.get('success') and fetch_data.get('data'):
+						user_profile = fetch_data['data']
+						print(f'[INFO] {account_name}: Session verified via manual API fetch')
+				except Exception as e:
+					debug_print(f'[INFO] {account_name}: Manual API fetch failed: {e}')
+
+		if not user_profile:
+			print(f'[FAILED] {account_name}: Browser session verification failed (WAF or auth issue)')
+			await save_login_screenshot(page, provider_name, account_name, 'session-verify-failed')
+			debug_print(f'[INFO] {account_name}: Current URL: {page.url}')
+			await context.close()
+			return None
+
+		# Get ALL cookies from the browser (including freshly resolved WAF cookies)
+		cookies = await context.cookies()
+		all_cookies = {
+			cookie.get('name'): cookie.get('value') for cookie in cookies
+			if cookie.get('name') and cookie.get('value')
+		}
+		api_user = str(user_profile['id']) if user_profile.get('id') is not None else None
+
+		success_msg = f'[SUCCESS] {account_name}: Session verified via browser, got {len(all_cookies)} cookies'
+		if is_debug_enabled() and api_user:
+			success_msg += f', api_user={api_user}'
+		print(success_msg)
+		await context.close()
+		return BrowserLoginResult(cookies=all_cookies, api_user=api_user)
+
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Browser session verification failed: {e}')
+		if page is not None:
+			await save_login_screenshot(page, provider_name, account_name, 'session-verify-error')
+		await context.close()
+		return None
+
+
 def get_user_info(client, headers, user_info_url: str):
 	"""获取用户信息"""
 	try:
@@ -388,6 +528,12 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		if not user_cookies:
 			print(f'[FAILED] {account_name}: Invalid configuration format')
 			return False, None, None
+		# prepare_cookies handles WAF bypass internally:
+		#   1. Opens headless browser → navigates to login page → resolves WAF → extracts WAF cookies
+		#   2. Merges WAF cookies with session cookies
+		#   3. Returns combined cookie dict for httpx requests
+		# Chromium 140 add_cookies() regression does NOT affect this path —
+		# httpx sends cookies directly in the Cookie header, not via browser's cookie jar.
 		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
 		auth_method = 'session cookies'
 
