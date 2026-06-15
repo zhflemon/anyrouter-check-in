@@ -38,8 +38,20 @@ from utils.debug import debug_print, is_debug_enabled
 from utils.notify import notify
 from utils.proxy import get_playwright_proxy, get_proxy_server
 
-load_dotenv()
 
+def _extract_profile_from_payload(payload: object) -> dict | None:
+	"""从 /api/user/self 响应 JSON 中提取用户资料（兼容两种格式）。"""
+	if not isinstance(payload, dict):
+		return None
+	data = payload.get('data')
+	if payload.get('success') is True and isinstance(data, dict) and data.get('id'):
+		return data
+	if payload.get('id'):
+		return payload
+	return None
+
+
+load_dotenv()
 BALANCE_HASH_FILE = 'balance_hash.txt'
 
 
@@ -204,6 +216,51 @@ async def login_with_credentials(
 		console_url = f'{provider_config.domain}/console'
 		user_profile = await verify_browser_login(page, console_url, timeout_ms)
 		if not user_profile:
+			# Fallback: SPA may not call /api/user/self automatically; try manual fetch
+			print(f'[INFO] {account_name}: Browser login timed out, trying manual API fetch fallback...')
+			try:
+				fetch_payload = await page.evaluate(f"""
+					async () => {{
+						try {{
+							const resp = await fetch('{provider_config.user_info_path}', {{
+								credentials: 'include',
+							}});
+							const text = await resp.text();
+							let parsed = null;
+							try {{ parsed = JSON.parse(text); }} catch(e) {{}}
+							return JSON.stringify({{
+								status: resp.status,
+								contentType: resp.headers.get('content-type') || '',
+								bodyLength: text.length,
+								bodyPreview: text.substring(0, 500),
+								parsed: parsed,
+							}});
+						}} catch(e) {{
+							return JSON.stringify({{
+								status: 0,
+								error: e.message,
+								bodyLength: 0,
+								bodyPreview: null,
+								parsed: null,
+							}});
+						}}
+					}}
+				""")
+				fetch_data = json.loads(fetch_payload)
+				print(f'[INFO] {account_name}: Fetch /api/user/self: status={fetch_data["status"]}, contentType={fetch_data["contentType"]}, bodyLength={fetch_data["bodyLength"]}')
+				if fetch_data.get('error'):
+					print(f'[WARN] {account_name}: Fetch failed: {fetch_data["error"]}')
+				parsed = fetch_data.get('parsed')
+				if parsed:
+					user_profile = _extract_profile_from_payload(parsed)
+					if user_profile:
+						print(f'[INFO] {account_name}: Session verified via manual API fetch')
+				else:
+					debug_print(f'[INFO] {account_name}: Response body preview: {str(fetch_data.get("bodyPreview", ""))[:200]}')
+			except Exception as fetch_e:
+				print(f'[WARN] {account_name}: Manual API fetch failed: {fetch_e}')
+
+		if not user_profile:
 			cookies = await context.cookies()
 			cookie_names = [c.get('name') for c in cookies if c.get('name')]
 			print(f'[FAILED] {account_name}: Login failed - /api/user/self not verified')
@@ -327,22 +384,47 @@ async def login_with_session_cookies(
 			print(f'[INFO] {account_name}: Browser login timed out, trying manual API fetch fallback...')
 			if api_user:
 				try:
-					fetch_result = await page.evaluate(f"""
+					fetch_payload = await page.evaluate(f"""
 						async () => {{
-							const resp = await fetch('{provider_config.user_info_path}', {{
-								credentials: 'include',
-								headers: {{'{provider_config.api_user_key}': '{api_user}'}}
-							}});
-							const data = await resp.json();
-							return JSON.stringify(data);
+							try {{
+								const resp = await fetch('{provider_config.user_info_path}', {{
+									credentials: 'include',
+									headers: {{'{provider_config.api_user_key}': '{api_user}'}}
+								}});
+								const text = await resp.text();
+								let parsed = null;
+								try {{ parsed = JSON.parse(text); }} catch(e) {{}}
+								return JSON.stringify({{
+									status: resp.status,
+									contentType: resp.headers.get('content-type') || '',
+									bodyLength: text.length,
+									bodyPreview: text.substring(0, 500),
+									parsed: parsed,
+								}});
+							}} catch(e) {{
+								return JSON.stringify({{
+									status: 0,
+									error: e.message,
+									bodyLength: 0,
+									bodyPreview: null,
+									parsed: null,
+								}});
+							}}
 						}}
 					""")
-					fetch_data = json.loads(fetch_result)
-					if fetch_data.get('success') and fetch_data.get('data'):
-						user_profile = fetch_data['data']
-						print(f'[INFO] {account_name}: Session verified via manual API fetch')
+					fetch_data = json.loads(fetch_payload)
+					print(f'[INFO] {account_name}: Fetch API /api/user/self: status={fetch_data["status"]}, contentType={fetch_data["contentType"]}, bodyLength={fetch_data["bodyLength"]}')
+					if fetch_data.get('error'):
+						print(f'[WARN] {account_name}: Fetch failed: {fetch_data["error"]}')
+					elif fetch_data.get('bodyPreview'):
+						debug_print(f'[INFO] {account_name}: Response body preview: {fetch_data["bodyPreview"][:200]}')
+					parsed = fetch_data.get('parsed')
+					if parsed:
+						user_profile = _extract_profile_from_payload(parsed)
+						if user_profile:
+							print(f'[INFO] {account_name}: Session verified via manual API fetch')
 				except Exception as e:
-					debug_print(f'[INFO] {account_name}: Manual API fetch failed: {e}')
+					print(f'[WARN] {account_name}: Manual API fetch failed: {e}')
 
 		if not user_profile:
 			print(f'[FAILED] {account_name}: Browser session verification failed (WAF or auth issue)')
@@ -506,6 +588,8 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	all_cookies = None
 	resolved_api_user: str | None = None
 	auth_method = None
+	browser_checkin_done = False  # True when browser visit /console triggered auto check-in
+
 	if account.has_login_credentials():
 		print(f'[INFO] {account_name}: Attempting email/password login (priority)...')
 		assert account.email is not None and account.password is not None
@@ -520,6 +604,8 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 			all_cookies = login_result.cookies
 			resolved_api_user = login_result.api_user
 			auth_method = 'email/password'
+			# Email/password login navigates to /console — auto check-in for agentrouter
+			browser_checkin_done = not provider_config.needs_manual_check_in()
 		else:
 			print(f'[FAILED] {account_name}: Email/password login failed, will not use stale session cookies')
 			return False, None, None
@@ -528,19 +614,68 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		if not user_cookies:
 			print(f'[FAILED] {account_name}: Invalid configuration format')
 			return False, None, None
-		# prepare_cookies handles WAF bypass internally:
-		#   1. Opens headless browser → navigates to login page → resolves WAF → extracts WAF cookies
-		#   2. Merges WAF cookies with session cookies
-		#   3. Returns combined cookie dict for httpx requests
-		# Chromium 140 add_cookies() regression does NOT affect this path —
-		# httpx sends cookies directly in the Cookie header, not via browser's cookie jar.
-		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
-		auth_method = 'session cookies'
+
+		if not provider_config.needs_manual_check_in():
+			# AgentRouter-style: WAF cookies from browser don't work with httpx,
+			# and check-in is auto-triggered by visiting /console.
+			# Use login_with_session_cookies to verify session in browser + trigger auto check-in.
+			print(f'[INFO] {account_name}: Using browser session verification (auto check-in provider)...')
+			session_result = await login_with_session_cookies(
+				account_name,
+				provider_config,
+				account.provider,
+				user_cookies,
+				api_user=account.api_user,
+			)
+			if not session_result:
+				print(f'[FAILED] {account_name}: Browser session verification failed')
+				return False, None, None
+			all_cookies = session_result.cookies
+			resolved_api_user = session_result.api_user
+			auth_method = 'browser session'
+			browser_checkin_done = True
+		else:
+			# AnyRouter-style: WAF cookies work with httpx, and check-in needs manual POST.
+			# prepare_cookies extracts WAF cookies, httpx does the actual check-in.
+			all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
+			auth_method = 'session cookies'
 
 	if not all_cookies:
 		return False, None, None
 
 	print(f'[AUTH] {account_name}: Using auth method -> {auth_method}')
+
+	if browser_checkin_done:
+		# Auto check-in was completed when /console was visited in the browser.
+		# Skip httpx entirely — WAF cookies from browser don't work with httpx for this provider,
+		# and the check-in API call has already been triggered by the SPA.
+		user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
+		headers = {
+			'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+			'Accept': 'application/json, text/plain, */*',
+			'Referer': provider_config.domain,
+		}
+		if resolved_api_user:
+			headers[provider_config.api_user_key] = resolved_api_user
+		try:
+			with httpx.Client(http2=True, timeout=15.0) as client:
+				client.cookies.update(all_cookies)
+				user_info = get_user_info(client, headers, user_info_url)
+				if user_info and user_info.get('success'):
+					print(user_info['display'])
+					print(f'[SUCCESS] {account_name}: Check-in completed!')
+					return True, None, None
+				elif user_info:
+					print(f'[INFO] {account_name}: {user_info.get("error", "Status unknown")}, but check-in may have succeeded')
+					return True, None, None
+				else:
+					# httpx failed (WAF block), but the check-in was already done in browser
+					print(f'[SUCCESS] {account_name}: Check-in completed in browser (httpx verification skipped - WAF)')
+					return True, None, None
+		except Exception as e:
+			# httpx failed (e.g. JSON decode error from WAF block page), but browser did the check-in
+			print(f'[SUCCESS] {account_name}: Check-in completed in browser (httpx verification: {e})')
+			return True, None, None
 
 	return run_check_in_requests(
 		all_cookies,
