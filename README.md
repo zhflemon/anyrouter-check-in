@@ -405,7 +405,7 @@ ANYROUTER_ACCOUNTS=[{"name":"主账号","provider":"anyrouter","email":"your@ema
 # 手动运行
 uv run checkin.py
 
-# 使用批处理文件运行（自动保存日志到 logs/ 目录）
+# 使用批处理文件运行（自动保存日志当前路径到 logs/ 目录）
 run_checkin.bat
 
 # 静默运行（不暂停）
@@ -420,7 +420,7 @@ uv run scripts/clean_actions_runs.py --keep 10
 1. 双击 `run_checkin.bat` 测试能否正常运行
 2. 打开 **任务计划程序**
 3. 点击右侧 **创建基本任务**
-4. 名称：`AnyRouter 签到`
+4. 名称：`AnyRouter签到`
 5. 触发器：**每天**，设定时间（建议凌晨或跟你 Actions 错开）
 6. 操作：**启动程序** → 浏览选择 `run_checkin.bat`，参数填 `--no-pause`
 7. 完成
